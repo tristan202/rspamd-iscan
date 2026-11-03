@@ -8,23 +8,29 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httputil"
+	"time"
 )
 
+// requestTimeout limits how long a hanging rspamd can block the daemon.
+const requestTimeout = time.Minute
+
 type Client struct {
-	checkURL string
-	hamURL   string
-	spamURL  string
-	logger   *slog.Logger
-	password string
+	checkURL   string
+	hamURL     string
+	spamURL    string
+	logger     *slog.Logger
+	password   string
+	httpClient *http.Client
 }
 
 func New(logger *slog.Logger, url, password string) *Client {
 	return &Client{
-		checkURL: url + "/checkv2",
-		hamURL:   url + "/learnham",
-		spamURL:  url + "/learnspam",
-		logger:   logger.WithGroup("rspamc").With("server", url),
-		password: password,
+		checkURL:   url + "/checkv2",
+		hamURL:     url + "/learnham",
+		spamURL:    url + "/learnspam",
+		logger:     logger.WithGroup("rspamc").With("server", url),
+		password:   password,
+		httpClient: &http.Client{Timeout: requestTimeout},
 	}
 }
 
@@ -62,17 +68,16 @@ func (c *Client) logResp(ctx context.Context, resp *http.Response) {
 func (c *Client) sendRequest(ctx context.Context, url string, msg io.Reader, result any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, msg)
 	if err != nil {
-		return nil
+		return err
 	}
 
 	c.logReq(ctx, req)
 
 	req.Header.Add("password", c.password)
 
-	// TODO: use custom client with configured timeouts
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil
+		return err
 	}
 
 	defer func() {
@@ -90,13 +95,17 @@ func (c *Client) sendRequest(ctx context.Context, url string, msg io.Reader, res
 		return fmt.Errorf("request failed with status: %s", resp.Status)
 	}
 
+	// learn requests don't need the response body, it is drained by the
+	// deferred function
+	if result == nil {
+		return nil
+	}
+
 	const contentTypeJSON = "application/json"
 	ctype := resp.Header.Get("Content-Type")
 	if ctype != contentTypeJSON {
 		return fmt.Errorf("got response with content-type: %q, expecting: %q", ctype, contentTypeJSON)
 	}
-
-	c.logResp(ctx, resp)
 
 	err = json.NewDecoder(resp.Body).Decode(result)
 	if err != nil {
